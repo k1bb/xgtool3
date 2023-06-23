@@ -1,0 +1,8 @@
+LICENSE
+setup.py
+xgtool3/__init__.py
+xgtool3/__main__.py
+xgtool3.egg-info/PKG-INFO
+xgtool3.egg-info/SOURCES.txt
+xgtool3.egg-info/dependency_links.txt
+xgtool3.egg-info/top_level.txt
