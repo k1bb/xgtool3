@@ -3,10 +3,13 @@
 import os, glob
 from datetime import datetime
 import numpy as np
+import numpy.ma as ma
 import pandas as pd
 import xarray as xr
 import dask
 import dask.array as da
+# import dask.array.ma as ma
+import cftime
 
 HEADLEN     = 1024  # ヘッダのデータ長
 DELIMLEN    = 4     # デリミタのデータ長
@@ -25,315 +28,343 @@ INTITEMS    = ['FNUM', 'DNUM', 'TIME', 'TDUR', 'ASTR1', 'AEND1',
                'ASTR2', 'AEND2', 'ASTR3', 'AEND3', 'STYP', 'SIZE']      # 整数のヘッダ項目
 FLTITEMS    = ['MISS', 'DMIN', 'DMAX', 'DIVS', 'DIVL']                  # 実数のヘッダ項目
 
-RLEN        = {'UR4':4, 'UR8':8, 'URY16':2, 'MR4':4}                    # フォーマットごとのデータ長
 NDTYP       = {'UR4':'f4', 'UR8':'f8', 'URY16':'u2', 'MR4':'f4'}        # フォーマットごとのデータ型
 
 GTAXDIR     = os.environ.get('GTAXDIR') # 軸データの場所
 
 DIMNAME     = {'latitude':'lat', 'longitude':'lon', 'pressure':'plev'}  # 軸名の短縮形
 
+class MultiFileGtool3():
+
+    def __init__(self, path, omit='neither'):
+        self.paths = self.list_paths(path, omit)
+        self.datainfo = Gtool3(self.paths[0]).datainfo
+        return
+
+    def list_paths(self, path, omit):
+        if os.path.isfile(path):
+            path = [path]
+        else:
+            path = glob.glob(path)
+            if len(path) == 0:
+                raise ValueError('No Files Found!')
+            path.sort()
+            if omit == 'neither':
+                pass
+            elif omit == 'max':
+                # 最後のファイルを使わない
+                # 書き込み中の場合など
+                path = path[:-1]
+            elif omit == 'min':
+                # 最初のファイルを使わない
+                # 初期条件が入っている場合など
+                path = path[1:]
+            elif omit == 'both':
+                path = self.path[1:-1]
+            else:
+                raise ValueError('Omit must be either "max", "min", "both", or "neither".')
+        return path
+    
+    def mfopen(self, unstack=True):
+        files = [Gtool3(path, self.datainfo) for path in self.paths]
+        data = [file.open_data() for file in files]
+        data = da.concatenate(data)
+        time = [file.make_time_ax() for file in files]
+        time = da.concatenate(time)
+        data = xr.DataArray(
+            name = self.datainfo['item'], 
+            data = data, 
+            dims = ['time', 'stax'], 
+            coords = {'time':time, 'stax':self.datainfo['stax']}, 
+            attrs = {'title':self.datainfo['title'], 'unit':self.datainfo['unit']}
+        )
+        data = data.where(data != self.datainfo['miss'])
+        if unstack or (self.datainfo['dfmt'] == 'URY16'):
+            data = data.unstack()
+        if self.datainfo['dfmt'] == 'URY16':
+            coefs = [file.open_coef() for file in files]
+            coefs = da.concatenate(coefs)
+            zdim = self.datainfo['dims'][0]
+            offset = xr.DataArray(
+                data = coefs[:,:,0], 
+                dims = ['time', zdim], 
+                coords = {'time':time, zdim:self.datainfo['coords'][zdim]}
+            )
+            scale = xr.DataArray(
+                data = coefs[:,:,1], 
+                dims = ['time', zdim], 
+                coords = {'time':time, zdim:self.datainfo['coords'][zdim]}
+            )
+            data = scale*data + offset
+        if unstack:
+            data = data.squeeze()
+        return data
+
 class Gtool3():
 
-    def __init__(self, paths, omit='neither'):
-        self.paths = glob.glob(paths)
-        self.paths.sort()
-        if omit == 'max':
-            # 最後のファイルを使わない
-            # 書き込み中の場合など
-            self.paths = self.paths[:-1]
-        elif omit == 'min':
-            # 最初のファイルを使わない
-            # 初期条件が入っている場合など
-            self.paths = self.paths[1:]
-        elif omit == 'both':
-            self.paths = self.paths[1:-1]
-        self.files = [np.memmap(path, 'S1', 'r') for path in self.paths]
-        self.parse_file()
-        return
-        
-    def parse_file(self):
-        self.interpret_delim()
-        self.set_values1(self.read_header())
-        self.open_axs()
-        self.make_stacked_axs()
-        self.set_values2()
-        self.make_time_ax()
-        return
-
-    def interpret_delim(self):
-        # デリミタを使ってエンディアンを区別する
-        delim = self.file(0, 0, DELIMLEN)
-        delim_b = np.frombuffer(delim, dtype='>u4')[0]   # big endianを仮定して読む
-        delim_l = np.frombuffer(delim, dtype='<u4')[0]   # little endianを仮定して読む
-        if delim_b == HEADLEN:
-            self.endian = '>'   # big endianで読んだ結果がHEADLENと一致したら接頭辞として'>'
-        elif delim_l == HEADLEN:
-            self.endian = '<'   # little endianで読んだ結果が...
+    def __init__(self, path, datainfo=None):
+        self.path = path
+        if datainfo is None:
+            self.parse_file()
         else:
-            raise ValueError('DELIM does not match HEADLEN!')
+            self.datainfo = datainfo
+        self.file = self.mmap_dask_array()
         return
     
-    def read_header(self, i=0, j=0):
-        # i番目のファイルのj番目のブロックのヘッダを読む
-        if j==0:
-            st = DELIMLEN
+    def parse_file(self):
+        self.head = self.read_header()
+        self.datainfo = self.set_datainfo1()
+        if self.datainfo['dfmt'] == 'MR4':
+            self.read_mask()
+            self.datainfo = pd.concat([
+                self.datainfo, 
+                pd.Series({'mask':self.mask}), 
+                self.set_datainfo2()
+            ])
         else:
-            try:
-                st = j*self.blen + DELIMLEN
-            except:
-                # blenがない場合はエラー　
-                raise ValueError('Block Length is unknown.')
-        values = self.file(i, st, HEADLEN).view('S16')
-        values = [v.decode().strip() for v in values]
-        values = dict(zip(HDITEMS, values))
+            self.datainfo = pd.concat([
+                self.datainfo, 
+                self.set_datainfo2()
+            ])
+        self.open_axs()
+        self.make_stacked_axs()
+        return
+    
+    def interpret_delim(self):
+        # デリミタを使ってエンディアンを区別する
+        b_delim = np.memmap(self.path, dtype='>u4', mode='r', shape=1)
+        l_delim = np.memmap(self.path, dtype='<u4', mode='r', shape=1)
+        if b_delim == HEADLEN:
+            # デリミタをbig endianで読んでみた結果がHEADLENと一致した
+            endian = '>'
+        elif l_delim == HEADLEN:
+            # デリミタをlittle endianで読んでみた結果がHEADLENと一致した
+            endian = '<'
+        else:
+            raise ValueError('DELIM does not match HEADLEN!')
+        return endian
+
+    def read_header(self):
+        # 最初のブロックのヘッダを読む
+        head = np.memmap(self.path, dtype='S16', mode='r', offset=DELIMLEN, shape=HEADLEN//16)
+        head = [h.decode().strip() for h in head]
+        head = dict(zip(HDITEMS, head))
         for item in INTITEMS:
             # 整数の項目を文字列から整数に直す
             # ただし空欄はそのまま
-            values[item] = int(values[item]) if values[item] != '' else ''
+            head[item] = int(head[item]) if head[item] != '' else ''
         for item in FLTITEMS:
             # 実数の項目を文字列から実数に直す
             # ただし空欄はそのまま
-            values[item] = float(values[item]) if values[item] != '' else ''
-        values = pd.Series(values)
-        return values
-    
-    def set_values1(self, values):
-        # ヘッダの情報をもとに変数を設定する
-        self.nfiles = len(self.paths)
-        self.filelen = len(self.file())
-        self.dfmt = values.DFMT
-        self.shape = [
-            values['AEND'+str(i+1)] - values['ASTR'+str(i+1)] + 1 for i in range(3)
+            head[item] = float(head[item]) if head[item] != '' else ''
+        head = pd.Series(head)
+        return head
+
+    def set_datainfo1(self):
+        # ヘッダの情報等をもとに変数を設定する
+        filelen = os.path.getsize(self.path)
+        endian = self.interpret_delim()
+        dfmt = self.head.DFMT
+        shape = [
+            self.head['AEND'+str(i+1)] - self.head['ASTR'+str(i+1)] + 1 for i in range(3)
         ][::-1]
-        if values['SIZE'] == '':
-            self.size = self.shape[0]*self.shape[1]*self.shape[2]
-        else:
-            self.size = values['SIZE']
-        self.axnm = [values['AITM'+str(i+1)] for i in range(3)][::-1]
-        self.axsel = [slice(values['ASTR'+str(i+1)]-1, values['AEND'+str(i+1)]) for i in range(3)][::-1]
-        self.rlen = RLEN[self.dfmt]
-        self.ndtyp = self.endian + NDTYP[self.dfmt]
-        self.miss = (values['MISS'] if self.dfmt != 'URY16' else
-                     int.from_bytes(b'\xff\xff', byteorder=('big' if self.endian=='>' else 'little')))
-        self.item = values['ITEM']
-        self.title = values['TITL1'] + values['TITL2']
-        self.unit = values['UNIT']
-        self.coeflen = 8*2*self.shape[0]
-        return
-    
-    def set_values2(self):
-        # マスクの情報まで含めて変数を設定する
-        self.datasize = len(self.stax)
-        self.datalen = self.datasize*self.rlen
-        # ブロック１つあたりの長さ
-        if self.dfmt == 'URY16':
-            self.blen = 6*DELIMLEN + HEADLEN + self.coeflen + self.datalen
-        elif self.dfmt == 'MR4':
-            self.blen = 3*DELIMLEN + HEADLEN + 2*12 + self.size//8 + self.datalen
-        else:
-            self.blen = 4*DELIMLEN + HEADLEN + self.datalen
-        if self.filelen%self.blen != 0:
-            # raise ValueError('BLEN is not correct!')
-            print('filelen/blen = ', self.filelen/self.blen)
-        self.nblocks = self.filelen//self.blen
-        return
-    
-    def make_stacked_axs(self):
-        # x, y, z軸をスタックした軸データを作る
-        if self.dfmt == 'MR4':
-            # MR4のデータではマスクを読み取る
-            mask = self.file(
-                0, 
-                3*DELIMLEN + HEADLEN + 12, 
-                self.size//8
-            )
-            mask = np.frombuffer(mask, dtype=np.uint8)
-            mask = np.unpackbits(mask)
-            mask = mask.astype(int)
-            mask = mask.reshape(self.shape)
-        else:
-            # それ以外の場合、np.onesを仮にマスクとして使用する
-            mask = np.ones(self.shape)
-        mask = xr.DataArray(
-            name = 'mask', 
-            data = mask, 
-            dims = self.dims, 
-            coords = {self.dims[i]:self.axs[i] for i in range(3)}
-        )
-        mask = mask.stack(stax=self.dims)
-        if self.dfmt == 'MR4':
-            mask = mask.where(mask==1, drop=True)
+        size = shape[0]*shape[1]*shape[2]
+        axnm = [self.head['AITM'+str(i+1)] for i in range(3)][::-1]
+        axsel = [slice(self.head['ASTR'+str(i+1)]-1, self.head['AEND'+str(i+1)]) for i in range(3)][::-1]
+        ndtyp = endian + NDTYP[dfmt]
+        rlen = int(ndtyp[-1])   # ビット数
+        miss = (self.head['MISS'] if dfmt != 'URY16' else
+                     int.from_bytes(b'\xff\xff', byteorder=('big' if endian=='>' else 'little')))
+        item = self.head['ITEM']
+        title = self.head['TITL1'] + self.head['TITL2']
+        unit = self.head['UNIT']
+        coefsize = 2*shape[0] if dfmt == 'URY16' else None
+        coeflen = 8*coefsize if dfmt == 'URY16' else None
+        datainfo1 = pd.Series({
+            'filelen':filelen, 'endian':endian, 'dfmt':dfmt, 'shape':shape, 
+            'size':size, 'axnm':axnm, 'axsel':axsel, 'ndtyp':ndtyp, 
+            'rlen':rlen, 'miss':miss, 'item':item, 'title':title, 
+            'unit':unit,
+        })
+        if dfmt == 'URY16':
+            datainfo1 = pd.concat([
+                datainfo1, 
+                pd.Series({'coefsize':coefsize, 'coeflen':coeflen})
+            ])
+        return datainfo1
+
+    def read_mask(self):
+        dtype = 'u1'
+        offset = 3*DELIMLEN + HEADLEN + 12
+        shape = self.datainfo['size']//8
+        mask = np.memmap(self.path, dtype=dtype, offset=offset, shape=shape)
+        mask = np.unpackbits(mask)
+        mask = mask.astype(int)
+        mask = ma.masked_where(mask == 0, mask)
+        mask = mask.astype(self.datainfo.ndtyp)
         self.mask = mask
-        self.stax = mask.stax
         return
     
-    def make_time_ax(self):
-        tmax = []
-        for i in range(self.nfiles):
-            for j in range(self.nblocks):
-                values = self.read_header(i, j)
-                time = values['DATE']
-                time = datetime.strptime(time, '%Y%m%d %H%M%S')
-                time = np.datetime64(time)
-                tmax.append(time)
-        tmax = np.array(tmax)
-        self.tmax = tmax
+    def set_datainfo2(self):
+        # マスクの情報まで含めて変数を設定する
+        if self.datainfo['dfmt'] == 'MR4':
+            datasize = np.count_nonzero(self.mask)
+        else:
+            datasize = self.datainfo['size']
+        datalen = datasize*self.datainfo['rlen']
+        # ブロック１つあたりの長さ
+        if self.datainfo['dfmt'] == 'URY16':
+            blen = 6*DELIMLEN + HEADLEN + self.datainfo['coeflen'] + datalen
+        elif self.datainfo['dfmt'] == 'MR4':
+            blen = 3*DELIMLEN + HEADLEN + 2*12 + self.datainfo['size']//8 + datalen
+        else:
+            blen = 4*DELIMLEN + HEADLEN + datalen
+        if self.datainfo['filelen']%blen != 0:
+            # raise ValueError('BLEN is not correct!')
+            print('filelen/blen = ', self.datainfo['filelen']/blen)
+        nblocks = self.datainfo['filelen']//blen
+        datainfo2 = pd.Series({
+            'datasize':datasize, 'datalen':datalen, 'blen':blen, 'nblocks':nblocks
+        })
+        return datainfo2
+
+    def read_chunks(self):
+        chunks = [self.mmap_dask_array(path) for path in self.paths]
+        chunks = da.concatenate(chunks)
+        self.chunks = chunks
         return
-    
-    def open(self, unstack=True):
-        chunks = []
-        for i in range(self.nfiles):
-            for j in range(self.nblocks):
-                chunks.append(self.read_data_chunk(i, j))
-        chunks = da.stack(chunks)
-        data = xr.DataArray(
-            name = self.item, 
-            data = chunks, 
-            dims = ['time', 'stax'], 
-            coords = {'time':self.tmax, 'stax':self.stax}, 
-            attrs = {'title':self.title, 'unit':self.unit, 'item':self.item}
-        )
-        data = data.where(data != self.miss)
-        if unstack:
-            data = data.unstack()
-        if self.dfmt == 'URY16':
-            self.open_coef()
-            if not unstack:
-                print('You need to manually apply coefs after unstacking the DataArray.')
-            else:
-                data = self.offset + data*self.scale
+
+    def open_axs(self):
+        coords = {}
         for i in range(3):
-            for attr in self.axs[i].attrs:
-                data[self.dims[i]].attrs[attr] = self.axs[i].attrs[attr]
-        data = data.squeeze()
-        data = data.chunk({'time':'auto'})
+            path = GTAXDIR + '/GTAXLOC.' + self.datainfo['axnm'][i]
+            ax = Gtool3Ax(path).open()[self.datainfo['axsel'][i]]
+            coords[ax.name] = ax
+        self.datainfo = pd.concat([
+            self.datainfo, 
+            pd.Series({'coords':coords, 'dims':list(coords.keys())})
+        ])
+        return
+
+    def make_stacked_axs(self):
+        if self.datainfo['dfmt'] == 'MR4':
+            data = self.datainfo['mask'].reshape(self.datainfo['shape'])
+        else:
+            data = da.ones(self.datainfo['shape'])
+        data = xr.DataArray(
+            data = data, 
+            dims = self.datainfo['dims'], 
+            coords = self.datainfo['coords']
+        )
+        data = data.stack(stax=self.datainfo['dims'])
+        if self.datainfo['dfmt'] == 'MR4':
+            data = data.dropna(dim='stax')
+        stax = data.stax
+        self.datainfo = pd.concat([
+            self.datainfo, 
+            pd.Series({'stax':stax})
+        ])
+        return
+
+    def make_time_ax(self):
+        st = DELIMLEN + 16*26
+        time = self.file[:, st:st+16].view('S16')
+        time = da.concatenate(time)
+        time = time.compute()
+        time = [np.datetime64(datetime.strptime(t.decode().strip(), '%Y%m%d %H%M%S')) for t in time]
+        time = np.array(time)
+        return time
+
+    def open(self, unstack=True):
+        data = self.open_data()
+        time = self.make_time_ax()
+        data = xr.DataArray(
+            name = self.datainfo['item'], 
+            data = data, 
+            dims = ['time', 'stax'], 
+            coords = {'time':time, 'stax':self.datainfo['stax']}
+        )
+        data = data.where(data != self.datainfo['miss'])
+        if unstack or (self.datainfo['dfmt'] == 'URY16'):
+            data = data.unstack()
+        if self.datainfo['dfmt'] == 'URY16':
+            coef = self.open_coef()
+            zdim = self.datainfo['dims'][0]
+            offset = xr.DataArray(
+                data = coef[:,:,0], 
+                dims = ['time', zdim], 
+                coords = {'time':time, zdim:self.datainfo['coords'][zdim]}
+            )
+            scale = xr.DataArray(
+                data = coef[:,:,1], 
+                dims = ['time', zdim], 
+                coords = {'time':time, zdim:self.datainfo['coords'][zdim]}
+            )
+            self.scale = scale
+            self.offset = offset
+            self.test0 = data
+            data = scale*data + offset
+            self.test1 = data
+        if unstack:
+            data = data.squeeze()
+        data = data.assign_attrs({'title':self.datainfo['title'], 'unit':self.datainfo['unit']})
+        return data
+    
+    def open_data(self):
+        st = self.datainfo['blen'] - (self.datainfo['datalen'] + DELIMLEN)
+        data = self.file[:,st:st+self.datainfo['datalen']]
+        data = data.view(self.datainfo.ndtyp)
         return data
     
     def open_coef(self):
-        chunks = []
-        for i in range(self.nfiles):
-            for j in range(self.nblocks):
-                chunks.append(self.read_coef_chunk(i, j))
-        chunks = da.stack(chunks)
-        chunks = chunks.reshape([self.nblocks*self.nfiles, self.shape[0], 2])
-        zdim, zax = self.dims[0], self.axs[0]
-        self.offset = xr.DataArray(
-            name = 'offset', 
-            data = chunks[:,:,0], 
-            dims = ['time', zdim], 
-            coords = {'time':self.tmax, zdim:zax}
-        )
-        self.scale = xr.DataArray(
-            name = 'scale', 
-            data = chunks[:,:,1], 
-            dims = ['time', zdim], 
-            coords = {'time':self.tmax, zdim:zax}
-        )
-        return
+        # st = 5*DELIMLEN + HEADLEN
+        st = 3*DELIMLEN + HEADLEN
+        coef = self.file[:,st:st+self.datainfo['coeflen']]
+        coef = coef.view(self.datainfo['endian'] + 'f8')
+        coef = coef.reshape([self.datainfo['nblocks'], self.datainfo['shape'][0], 2])
+        return coef
     
-    def open_axs(self):
-        axs = []
-        for i in range(3):
-            path = GTAXDIR + '/GTAXLOC.' + self.axnm[i]
-            sel = self.axsel[i]
-            try:
-                ax = Gtool3Ax(path, sel).open()
-            except:
-                nm = ['z', 'y', 'x'][i] + '_NotFound'
-                data = np.arange(self.shape[i])
-                ax = xr.DataArray(
-                    name = nm, 
-                    data = data, 
-                    dims = nm, 
-                    coords = {nm:data}
-                )
-            axs.append(ax)
-        self.dims = [ax.name for ax in axs]
-        self.axs = axs
-        return
-    
-    def read_data_chunk(self, i, j):
-        # i番目のファイルのj番目のブロックのデータを読み出す
-        st = (j+1)*self.blen - (self.datalen+DELIMLEN)
-        chunk = self.read_chunk(i, st, self.datalen, self.ndtyp)
-        return chunk
-    
-    def read_coef_chunk(self, i, j):
-        # URY16フォーマットのとき、i番目のファイルのj番目のブロックの係数を読み出す
-        st = (j+1)*self.blen - (3*DELIMLEN + self.coeflen + self.datalen)
-        dtype = self.endian + 'f8'
-        chunk = self.read_chunk(i, st, self.coeflen, dtype)
-        return chunk
-    
-    def read_chunk(self, i, st, ln, dtype):
+    def mmap_load_chunks(self):
+        return np.memmap(self.path, dtype='S1', mode='r', shape=self.datainfo['filelen'])
+
+    def mmap_dask_array(self):
+        load = dask.delayed(self.mmap_load_chunks)
         chunk = da.from_delayed(
-            dask.delayed(np.frombuffer(self.file(i, st, ln), dtype=dtype)), 
-            shape=[ln/int(dtype[-1])], dtype=dtype
-        )
+            load(), shape=[self.datainfo['filelen']], dtype='S1'
+        ).reshape([self.datainfo['nblocks'], self.datainfo['blen']])
         return chunk
-    
-    def file(self, i=0, st=0, ln=0):
-        # i番目のファイルのstからlnまでを切り出す
-        memmap = self.files[i]
-        if st == ln:
-            return memmap
-        else:
-            return memmap[st:st+ln]
-        
+
 class Gtool3Ax(Gtool3):
 
-    def __init__(self, path, sel):
-        self.sel = sel
-        self.paths = [path]
-        self.files = [np.memmap(path, 'S1', 'r')]
-        self.parse_file()
-        self.open()
-        return
-
     def parse_file(self):
-        self.interpret_delim()
-        self.set_values1(self.read_header())
-        self.set_values2()
-        return
-
-    def set_values2(self):
-        # マスクの情報まで含めて変数を設定する
-        self.datasize = self.size
-        self.datalen = self.datasize*self.rlen
-        # ブロック１つあたりの長さ
-        if self.dfmt == 'URY16':
-            self.blen = 6*DELIMLEN + HEADLEN + self.coeflen + self.datalen
-        elif self.dfmt == 'MR4':
-            self.blen = 3*DELIMLEN + HEADLEN + 2*12 + self.size//8 + self.datalen
+        self.head = self.read_header()
+        self.datainfo = self.set_datainfo1()
+        if self.datainfo['dfmt'] == 'MR4':
+            self.read_mask()
+            self.datainfo = pd.concat([
+                self.datainfo, 
+                pd.Series({'mask':self.mask}), 
+                self.set_datainfo2()
+            ])
         else:
-            self.blen = 4*DELIMLEN + HEADLEN + self.datalen
-        if self.filelen%self.blen != 0:
-            # raise ValueError('BLEN is not correct!')
-            print('filelen/blen = ', self.filelen/self.blen)
-        self.nblocks = self.filelen//self.blen
+            self.datainfo = pd.concat([
+                self.datainfo, 
+                self.set_datainfo2()
+            ])
+        self.file = self.mmap_dask_array()
         return
 
     def open(self):
-        chunk = self.read_data_chunk(0,0)[self.sel]
         try:
-            dim = DIMNAME[self.title]
+            title = DIMNAME[self.datainfo['title']]
         except:
-            dim = self.title
+            title = self.datainfo['title']
+        data = self.open_data()[0, :]
         data = xr.DataArray(
-            name = dim, 
-            data = chunk, 
-            dims = [dim], 
-            coords = {dim:chunk}, 
-            attrs = {'title':self.title, 'unit':self.unit, 'item':self.item}
+            name = title, 
+            data = data, 
+            dims = [title], 
+            coords = {title:data}, 
+            attrs = {'item':self.datainfo['item'], 'title':self.datainfo['title'], 'unit':self.datainfo['unit']}
         )
-        data = data.where(data != self.miss)
-        data = data.unstack()
-        if self.dfmt == 'URY16':
-            self.open_coef()
-            data = self.offset + data*self.scale
         return data
-    
-class MultiFileGtool3(Gtool3):
-    # 古いバージョンとの互換性確保のために残しています
-    def mfopen(self):
-        return super().open()
