@@ -10,7 +10,7 @@ import pandas as pd
 import xarray as xr
 import dask
 import dask.array as da
-
+from dask.utils import M
 
 # fmt:off
 HEADLEN     = 1024  # ヘッダのデータ長
@@ -378,7 +378,11 @@ class Gtool3Ax(Gtool3):
             title = DIMNAME[self.datainfo["title"]]
         else:
             title = self.datainfo["title"]
-        data = self.open_data()[0, :]
+        data = (
+            self.open_data()[0, :]
+            .map_blocks(M.byteswap, True)
+            .map_blocks(M.newbyteorder, "=")
+        )
         data = xr.DataArray(
             name=title,
             data=data,
