@@ -288,12 +288,19 @@ class Gtool3:
         time = self.file[:, st : st + 16].view("S16")
         time = da.concatenate(time)
         time = time.compute()
-        time = [
-            np.datetime64(datetime.strptime(t.decode().strip(), "%Y%m%d %H%M%S"))
-            for t in time
-        ]
-        time = np.array(time)
-        return time
+        _time = np.empty(time.shape, dtype="O")
+        for i, t in enumerate(time):
+            dt = datetime.strptime(t.decode().strip(), "%Y%m%d %H%M%S")
+            _time[i] = cftime.datetime(
+                dt.year,
+                dt.month,
+                dt.day,
+                dt.hour,
+                dt.minute,
+                dt.second,
+                calendar="standard",
+            )
+        return _time
 
     def open(self, unstack=True):
         data = self.open_data()
