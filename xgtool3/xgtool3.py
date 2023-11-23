@@ -2,6 +2,7 @@
 
 import os
 import glob
+import sys
 from datetime import datetime
 import cftime
 import numpy as np
@@ -385,12 +386,11 @@ class Gtool3Ax(Gtool3):
             title = DIMNAME[self.datainfo["title"]]
         else:
             title = self.datainfo["title"]
-        data = (
-            self.open_data()[0, :]
-            .map_blocks(M.byteswap, True)
-            .map_blocks(M.newbyteorder, "=")
-            .compute()
-        )
+        data = self.open_data()[0, :].compute()
+        if (sys.byteorder == "little" and data.dtype.byteorder == ">") or (
+            sys.byteorder == "big" and data.dtype.byteorder == "<"
+        ):
+            data = data.byteswap().newbyteorder()
         data = xr.DataArray(
             name=title,
             data=data,
