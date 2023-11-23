@@ -75,7 +75,7 @@ class MultiFileGtool3:
         data = [file.open_data() for file in files]
         data = da.concatenate(data)
         time = [file.make_time_ax() for file in files]
-        time = da.concatenate(time)
+        time = np.concatenate(time)
         data = xr.DataArray(
             name=self.datainfo["item"],
             data=data,
@@ -389,6 +389,7 @@ class Gtool3Ax(Gtool3):
             self.open_data()[0, :]
             .map_blocks(M.byteswap, True)
             .map_blocks(M.newbyteorder, "=")
+            .compute()
         )
         data = xr.DataArray(
             name=title,
