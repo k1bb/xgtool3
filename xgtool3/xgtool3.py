@@ -71,7 +71,7 @@ class MultiFileGtool3:
         return path
 
     def mfopen(self, unstack=True):
-        files = [Gtool3(path, self.datainfo) for path in self.paths]
+        files = [Gtool3(path) for path in self.paths]
         data = [file.open_data() for file in files]
         data = da.concatenate(data)
         time = [file.make_time_ax() for file in files]
