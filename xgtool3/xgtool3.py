@@ -2,6 +2,7 @@
 
 import os
 import glob
+import sys
 from datetime import datetime
 import cftime
 import numpy as np
@@ -71,11 +72,11 @@ class MultiFileGtool3:
         return path
 
     def mfopen(self, unstack=True):
-        files = [Gtool3(path, self.datainfo) for path in self.paths]
+        files = [Gtool3(path) for path in self.paths]
         data = [file.open_data() for file in files]
         data = da.concatenate(data)
         time = [file.make_time_ax() for file in files]
-        time = da.concatenate(time)
+        time = np.concatenate(time)
         data = xr.DataArray(
             name=self.datainfo["item"],
             data=data,
@@ -385,11 +386,11 @@ class Gtool3Ax(Gtool3):
             title = DIMNAME[self.datainfo["title"]]
         else:
             title = self.datainfo["title"]
-        data = (
-            self.open_data()[0, :]
-            .map_blocks(M.byteswap, True)
-            .map_blocks(M.newbyteorder, "=")
-        )
+        data = self.open_data()[0, :].compute()
+        if (sys.byteorder == "little" and data.dtype.byteorder == ">") or (
+            sys.byteorder == "big" and data.dtype.byteorder == "<"
+        ):
+            data = data.byteswap().newbyteorder()
         data = xr.DataArray(
             name=title,
             data=data,
