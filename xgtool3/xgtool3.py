@@ -338,6 +338,7 @@ class Gtool3:
         data = data.assign_attrs(
             {"title": self.datainfo["title"], "unit": self.datainfo["unit"]}
         )
+        data = data.rename(self.datainfo['item'])
         return data
 
     def open_data(self):
