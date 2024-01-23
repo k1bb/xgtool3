@@ -15,7 +15,6 @@ from dask.utils import M
 
 # fmt:off
 HEADLEN     = 1024  # ヘッダのデータ長
-DELIMLEN    = 4     # デリミタのデータ長
 HDITEMS     = ['IDFM',  'DSET',  'ITEM',  'EDIT1', 'EDIT2', 'EDIT3',
                'EDIT4', 'EDIT5', 'EDIT6', 'EDIT7', 'EDIT8', 'FNUM',
                'DNUM',  'TITL1', 'TITL2', 'UNIT',  'ETTL1', 'ETTL2',
@@ -108,14 +107,62 @@ class MultiFileGtool3:
 
 
 class Gtool3:
-    def __init__(self, path, datainfo=None):
+    def __init__(self, path, datainfo=None, access=None, endian=None):
         self.path = path
+        
+        # アクセス方法が指定されていない場合、デリミタから判断する
+        if access is None:
+            access = self.interpret_access_from_delimiter()
+        # アクセス方法に応じて、デリミタの長さを設定する
+        if access == "sequential":
+            self.delimlen = 4
+        elif access == "stream":
+            self.delimlen = 0
+        else:
+            raise ValueError('Access must be either "sequential" or "stream".')
+        
+        if endian is None:
+            if access == "sequential":
+                # sequentialの場合、エンディアンが指定されない場合はデリミタを使って判断する
+                self.endian = self.interpret_endian_from_delim()
+            elif access == "stream":
+                # streamの場合、エンディアンが指定されない場合はbig endianとする
+                self.endian = ">"
+            else:
+                # この分岐には来ないはず
+                raise ValueError('Access must be either "sequential" or "stream".')
+        else:
+            self.endian = endian
+
         if datainfo is None:
             self.parse_file()
         else:
             self.datainfo = datainfo
         self.file = self.mmap_dask_array()
         return
+
+    def interpret_access_from_delimiter(self):
+        # デリミタの有無でアクセス方法を区別する
+        b_delim = np.memmap(self.path, dtype=">u4", mode="r", shape=1)
+        l_delim = np.memmap(self.path, dtype="<u4", mode="r", shape=1)
+        if b_delim == HEADLEN or l_delim == HEADLEN:
+            return "sequential"
+        else:
+            return "stream"
+
+    def interpret_endian_from_delim(self):
+        # デリミタを使ってエンディアンを区別する
+        b_delim = np.memmap(self.path, dtype=">u4", mode="r", shape=1)
+        l_delim = np.memmap(self.path, dtype="<u4", mode="r", shape=1)
+        if b_delim == HEADLEN:
+            # デリミタをbig endianで読んでみた結果がHEADLENと一致した
+            endian = ">"
+        elif l_delim == HEADLEN:
+            # デリミタをlittle endianで読んでみた結果がHEADLENと一致した
+            endian = "<"
+        else:
+            raise ValueError("DELIM does not match HEADLEN!")
+        return endian
 
     def parse_file(self):
         self.head = self.read_header()
@@ -131,24 +178,10 @@ class Gtool3:
         self.make_stacked_axs()
         return
 
-    def interpret_delim(self):
-        # デリミタを使ってエンディアンを区別する
-        b_delim = np.memmap(self.path, dtype=">u4", mode="r", shape=1)
-        l_delim = np.memmap(self.path, dtype="<u4", mode="r", shape=1)
-        if b_delim == HEADLEN:
-            # デリミタをbig endianで読んでみた結果がHEADLENと一致した
-            endian = ">"
-        elif l_delim == HEADLEN:
-            # デリミタをlittle endianで読んでみた結果がHEADLENと一致した
-            endian = "<"
-        else:
-            raise ValueError("DELIM does not match HEADLEN!")
-        return endian
-
     def read_header(self):
         # 最初のブロックのヘッダを読む
         head = np.memmap(
-            self.path, dtype="S16", mode="r", offset=DELIMLEN, shape=HEADLEN // 16
+            self.path, dtype="S16", mode="r", offset=self.delimlen, shape=HEADLEN // 16
         )
         head = [h.decode().strip() for h in head]
         head = dict(zip(HDITEMS, head))
@@ -166,7 +199,7 @@ class Gtool3:
     def set_datainfo1(self):
         # ヘッダの情報等をもとに変数を設定する
         filelen = os.path.getsize(self.path)
-        endian = self.interpret_delim()
+        endian = self.endian
         dfmt = self.head.DFMT
         shape = [
             self.head["AEND" + str(i + 1)] - self.head["ASTR" + str(i + 1)] + 1
@@ -217,7 +250,7 @@ class Gtool3:
 
     def read_mask(self):
         dtype = "u1"
-        offset = 3 * DELIMLEN + HEADLEN + 12
+        offset = 3 * self.delimlen + HEADLEN + 12
         shape = self.datainfo["size"] // 8
         mask = np.memmap(self.path, dtype=dtype, offset=offset, shape=shape)
         mask = np.unpackbits(mask)
@@ -236,13 +269,13 @@ class Gtool3:
         datalen = datasize * self.datainfo["rlen"]
         # ブロック１つあたりの長さ
         if self.datainfo["dfmt"] == "URY16":
-            blen = 6 * DELIMLEN + HEADLEN + self.datainfo["coeflen"] + datalen
+            blen = 6 * self.delimlen + HEADLEN + self.datainfo["coeflen"] + datalen
         elif self.datainfo["dfmt"] == "MR4":
             blen = (
-                3 * DELIMLEN + HEADLEN + 2 * 12 + self.datainfo["size"] // 8 + datalen
+                3 * self.delimlen + HEADLEN + 2 * 12 + self.datainfo["size"] // 8 + datalen
             )
         else:
-            blen = 4 * DELIMLEN + HEADLEN + datalen
+            blen = 4 * self.delimlen + HEADLEN + datalen
         if self.datainfo["filelen"] % blen != 0:
             # raise ValueError('BLEN is not correct!')
             print("filelen/blen = ", self.datainfo["filelen"] / blen)
@@ -285,7 +318,7 @@ class Gtool3:
         return
 
     def make_time_ax(self):
-        st = DELIMLEN + 16 * 26
+        st = self.delimlen + 16 * 26
         time = self.file[:, st : st + 16].view("S16")
         time = da.concatenate(time)
         time = time.compute()
@@ -342,14 +375,14 @@ class Gtool3:
         return data
 
     def open_data(self):
-        st = self.datainfo["blen"] - (self.datainfo["datalen"] + DELIMLEN)
+        st = self.datainfo["blen"] - (self.datainfo["datalen"] + self.delimlen)
         data = self.file[:, st : st + self.datainfo["datalen"]]
         data = data.view(self.datainfo.ndtyp)
         return data
 
     def open_coef(self):
-        # st = 5*DELIMLEN + HEADLEN
-        st = 3 * DELIMLEN + HEADLEN
+        # st = 5*self.delimlen + HEADLEN
+        st = 3 * self.delimlen + HEADLEN
         coef = self.file[:, st : st + self.datainfo["coeflen"]]
         coef = coef.view(self.datainfo["endian"] + "f8")
         coef = coef.reshape([self.datainfo["nblocks"], self.datainfo["shape"][0], 2])
