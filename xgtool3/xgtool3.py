@@ -424,7 +424,7 @@ class Gtool3Ax(Gtool3):
         if (sys.byteorder == "little" and data.dtype.byteorder == ">") or (
             sys.byteorder == "big" and data.dtype.byteorder == "<"
         ):
-            data = data.byteswap().newbyteorder()
+            data = data.byteswap().view(data.dtype.newbyteorder())
         data = xr.DataArray(
             name=title,
             data=data,
