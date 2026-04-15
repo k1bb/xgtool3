@@ -1,5 +1,8 @@
 # xgtool3
 
+> [!WARNING]
+> **Deprecation Notice:** This library is no longer under development. Users are recommended to use [touza zbt](https://github.com/saitofuyuki/touza) instead.
+
 A Python library to read Gtool3 files as an xarray DataArray.
 
 ## Installation
